@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${RUN_PREDEPLOY_MIGRATIONS:-false}" in
+  true|TRUE|1|yes|YES)
+    ;;
+  false|FALSE|0|no|NO|'')
+    echo "Skipping Alembic migrations: RUN_PREDEPLOY_MIGRATIONS is not enabled."
+    exit 0
+    ;;
+  *)
+    echo "RUN_PREDEPLOY_MIGRATIONS must be set to true or false." >&2
+    exit 2
+    ;;
+esac
+
+BACKEND_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$BACKEND_DIR"
+
+has_revision_table() {
+  local database="$1"
+  local table_name="$2"
+  python - "$database" "$table_name" <<'PY'
+import sys
+from sqlalchemy import inspect
+if sys.argv[1] == "main":
+    from app.database.session import engine
+else:
+    from app.database.sensor_session import sensor_engine as engine
+raise SystemExit(0 if sys.argv[2] in inspect(engine).get_table_names() else 1)
+PY
+}
+
+# Existing production schemas may have been upgraded before Alembic tracking was
+# enabled. The stamp command verifies the entire schema before recording the
+# current revision. It refuses to stamp any schema that does not match models.
+if ! has_revision_table main alembic_version_main; then
+  python scripts/stamp_baseline.py main
+fi
+if ! has_revision_table sensor alembic_version_sensor; then
+  python scripts/stamp_baseline.py sensor
+fi
+
+# Apply all later revisions once in Render's pre-deploy process, not once per
+# application replica. In particular, this applies 0002_media_object_storage.
+make migrate

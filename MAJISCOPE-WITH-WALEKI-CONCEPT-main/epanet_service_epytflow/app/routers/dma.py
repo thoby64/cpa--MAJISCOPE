@@ -1,0 +1,912 @@
+# app/routers/dma.py
+"""
+DMA (District Metered Area) simulation endpoints.
+
+Endpoints
+---------
+GET  /dma/{filename}/layers
+POST /dma/{filename}/simulate               — baseline hydraulic run
+POST /dma/{filename}/simulate/advanced      — EPyT-Flow full scenario
+                                              (leakages, sensor faults, actuators,
+                                               uncertainties, sensor noise)
+GET  /dma/{filename}/simulate/{id}/nrw
+GET  /dma/{filename}/simulate/{id}/leakage
+GET  /dma/{filename}/simulate/{id}/tanks    — tank volume time-series
+"""
+
+import json
+import logging
+import os
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.auth import require_api_key
+from app.core.config import get_settings
+from app.core.database import get_db                       # ← correct FastAPI dependency
+from app.core.exceptions import GpkgNotFoundError, InvalidGpkgError
+from app.core.scenario_types import ALL_SCENARIO_TYPES, REPORTED_LEAK, validate_scenario_contract
+from app.models.simulation import SimResult, SimScenario
+from app.services.dma_builder import build_dma_inp, estimate_nrw
+from app.services.dma_ingest import ingest_dma
+from app.services.leak_report import LeakValidationError, ReportedLeak, resolve_and_validate_reports
+from app.services.leakage_report import analyse_leakage
+from app.workers.simulation_worker import (
+    _majiscope_metadata_for_file,
+    run_simulation_task,
+)
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/dma", tags=["dma"])
+
+
+def _prepared_uploaded_inp(filename: str) -> tuple[Optional[dict], Optional[str]]:
+    """Resolve the EPANET model MajiScope uploaded alongside a prepared DMA.
+
+    MajiScope can prepare a DMA from an existing `.inp` file. When it does,
+    the uploaded model is authoritative — it must be simulated as provided
+    instead of being rebuilt from the GIS layers.
+    """
+    if not (filename.startswith("majiscope_") and filename.endswith(".gpkg")):
+        return None, None
+    metadata_path = os.path.join(get_settings().gpkg_dir, f"{filename[:-5]}.json")
+    try:
+        with open(metadata_path, encoding="utf-8") as metadata_file:
+            metadata = json.load(metadata_file)
+    except FileNotFoundError:
+        return None, None
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Prepared hydraulic model metadata is invalid.",
+        ) from exc
+
+    candidate = metadata.get("inp_filename")
+    if not candidate:
+        return metadata, None
+    safe_candidate = os.path.basename(str(candidate))
+    inp_path = os.path.join(get_settings().inp_dir, safe_candidate)
+    if not os.path.isfile(inp_path):
+        raise HTTPException(
+            status_code=410,
+            detail="The uploaded EPANET model has expired. Prepare the model again.",
+        )
+    return metadata, inp_path
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GET /dma/{filename}/layers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _load_optional_layer_geojson(filename: str, layer_name: str) -> dict:
+    """Read an optional layer (e.g. the MajiScope reported-leaks layer) back
+    as a GeoJSON FeatureCollection. Returns an empty collection when the layer
+    is not present."""
+    empty = {"type": "FeatureCollection", "features": []}
+    try:
+        import geopandas as gpd
+    except ImportError:
+        return empty
+
+    settings = get_settings()
+    gpkg_path = os.path.join(settings.gpkg_dir, filename)
+    if not os.path.isfile(gpkg_path):
+        return empty
+
+    try:
+        gdf = gpd.read_file(gpkg_path, layer=layer_name)
+    except Exception:
+        return empty
+
+    if gdf.empty:
+        return empty
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:4326")
+    else:
+        gdf = gdf.to_crs("EPSG:4326")
+
+    try:
+        return json.loads(gdf.to_json())
+    except Exception:
+        return empty
+
+
+@router.get("/{filename}/layers")
+def get_dma_layers(
+    filename: str,
+    _: str = Depends(require_api_key),
+):
+    """Return all DMA asset layers as GeoJSON FeatureCollections."""
+    try:
+        dma = ingest_dma(filename, clip_to_dma=True)
+    except GpkgNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except InvalidGpkgError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    def point_feature(lon, lat, props):
+        return {"type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                "properties": props}
+
+    def line_features(pipes):
+        return [
+            {"type": "Feature",
+             "geometry": {"type": "LineString",
+                          "coordinates": [[x, y] for x, y in p.coords]},
+             "properties": {"fid": p.fid, "diam_mm": p.diam_mm, "hw_c": p.hw_c,
+                            "material": p.material, "purpose": p.purpose,
+                            "length_m": round(p.length_m, 1)}}
+            for p in pipes
+        ]
+
+    # Leak reports handed over by MajiScope when the model was prepared.
+    reported_leaks = _load_optional_layer_geojson(filename, "reported_leaks")
+
+    return {
+        "dma_name": dma.dma_name, "dma_bbox": dma.dma_bbox,
+        "reported_leaks": reported_leaks,
+        "boundary": {
+            "type": "FeatureCollection",
+            "features": [{"type": "Feature",
+                          "geometry": {"type": "Polygon",
+                                       "coordinates": [[[lon, lat] for lon, lat in dma.dma_polygon]]},
+                          "properties": {"name": dma.dma_name}}]},
+        "pipes": {"type": "FeatureCollection", "features": line_features(dma.pipes)},
+        "sources": {"type": "FeatureCollection",
+                    "features": [point_feature(s.lon, s.lat,
+                        {"fid": s.fid, "name": s.name, "elev_m": s.elev_m,
+                         "yield_m3h": s.yield_m3h, "total_head_m": round(s.total_head_m, 1),
+                         "status": s.status, "type": "borehole"}) for s in dma.sources]},
+        "tanks": {"type": "FeatureCollection",
+                  "features": [point_feature(t.lon, t.lat,
+                      {"fid": t.fid, "name": t.name, "elev_m": t.elev_m,
+                       "cap_m3": t.cap_m3, "init_level_m": t.init_level_m,
+                       "min_level_m": t.min_level_m, "max_level_m": t.max_level_m,
+                       "diameter_m": round(t.diameter_m, 2), "status": t.status,
+                       "type": "tank"}) for t in dma.tanks]},
+        "valves": {"type": "FeatureCollection",
+                   "features": [point_feature(v.lon, v.lat,
+                       {"fid": v.fid, "valve_type": v.valve_type,
+                        "diam_mm": v.diam_mm, "is_isolation": v.is_isolation,
+                        "kind": v.kind, "type": "valve",
+                        "status": ("Closed" if v.kind == "WASHOUT" else "Open")
+                                  if v.kind in ("ISOLATION", "WASHOUT") else v.status})
+                       for v in dma.valves]},
+        "bulk_meters": {"type": "FeatureCollection",
+                        "features": [point_feature(b.lon, b.lat,
+                            {"fid": b.fid, "name": b.name, "type": "bulk_meter"})
+                                     for b in dma.bulk_meters]},
+        "stats": {
+            "pipe_count": len(dma.pipes), "source_count": len(dma.sources),
+            "tank_count": len(dma.tanks), "valve_count": len(dma.valves),
+            "bulk_meter_count": len(dma.bulk_meters),
+            "total_pipe_length_m": round(sum(p.length_m for p in dma.pipes), 1),
+            "reported_leak_count": len(reported_leaks.get("features") or []),
+        },
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  POST /dma/{filename}/simulate  — baseline
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class DMAElementOverrides(BaseModel):
+    """Per-element parameter edits made in the map inspector panel, applied
+    to the ingested GIS records (by `fid`, as returned in /dma/{f}/layers)
+    before the .inp is rebuilt for this run. Every field is optional — only
+    edited attributes need to be sent."""
+    pipes: Optional[Dict[str, Dict[str, float]]] = Field(
+        None, description="fid -> {diam_mm?, hw_c?(roughness)}")
+    sources: Optional[Dict[str, Dict[str, float]]] = Field(
+        None, description="fid -> {total_head_m?}")
+    tanks: Optional[Dict[str, Dict[str, float]]] = Field(
+        None, description="fid -> {elev_m?, init_level_m?, min_level_m?, max_level_m?, diameter_m?}")
+    valves: Optional[Dict[str, Dict[str, object]]] = Field(
+        None, description="fid -> {diam_mm?, status?('Open'|'Closed') — ISOLATION/WASHOUT valves only}")
+
+
+def _apply_dma_overrides(dma, overrides: Optional[DMAElementOverrides]) -> Dict[int, str]:
+    """Mutate the ingested DMAData in place with inspector-panel edits,
+    keyed by `fid`. Returns a {valve fid: status} map for the valve-status
+    overrides that dma_builder.build_dma_inp() needs separately, since
+    valve status is derived at .inp-build time rather than stored on the
+    DMAValve record itself.
+    """
+    if overrides is None:
+        return {}
+
+    def _set(obj, field, value):
+        if value is not None:
+            setattr(obj, field, float(value))
+
+    if overrides.pipes:
+        by_fid = {p.fid: p for p in dma.pipes}
+        for fid_str, f in overrides.pipes.items():
+            p = by_fid.get(int(fid_str)) if fid_str.lstrip("-").isdigit() else None
+            if p is None:
+                continue
+            _set(p, "diam_mm", f.get("diam_mm"))
+            _set(p, "hw_c", f.get("hw_c"))
+
+    if overrides.sources:
+        by_fid = {s.fid: s for s in dma.sources}
+        for fid_str, f in overrides.sources.items():
+            s = by_fid.get(int(fid_str)) if fid_str.lstrip("-").isdigit() else None
+            if s is None:
+                continue
+            _set(s, "total_head_m", f.get("total_head_m"))
+
+    if overrides.tanks:
+        by_fid = {t.fid: t for t in dma.tanks}
+        for fid_str, f in overrides.tanks.items():
+            t = by_fid.get(int(fid_str)) if fid_str.lstrip("-").isdigit() else None
+            if t is None:
+                continue
+            for field in ("elev_m", "init_level_m", "min_level_m", "max_level_m", "diameter_m"):
+                _set(t, field, f.get(field))
+
+    valve_status_overrides: Dict[int, str] = {}
+    if overrides.valves:
+        by_fid = {v.fid: v for v in dma.valves}
+        for fid_str, f in overrides.valves.items():
+            v = by_fid.get(int(fid_str)) if fid_str.lstrip("-").isdigit() else None
+            if v is None:
+                continue
+            _set(v, "diam_mm", f.get("diam_mm"))
+            status = f.get("status")
+            if status:
+                valve_status_overrides[v.fid] = str(status).capitalize()
+
+    return valve_status_overrides
+
+
+class DMASimRequest(BaseModel):
+    name:            str   = Field("DMA hydraulic run", max_length=200)
+    duration_hrs:    int   = Field(24, ge=1, le=168)
+    time_step_min:   int   = Field(60, ge=5, le=360)
+    base_demand_m3h: float = Field(0.011, gt=0)
+
+    # scenario_type contract (app/core/scenario_types.py): this is a
+    # simulation engine that consumes leak events supplied by the main
+    # water-management system — it does not decide on its own where
+    # leaks are. leakage_frac (random/synthetic per-node leak
+    # generation) is only usable when scenario_type="research".
+    scenario_type: str = Field(
+        "baseline",
+        description=f"One of: {', '.join(sorted(ALL_SCENARIO_TYPES))}.",
+    )
+    leakage_frac: float = Field(
+        0.0, ge=0, le=1.0,
+        description="Research-only: fraction of nodes to receive a random synthetic leak event. Requires scenario_type='research'.",
+    )
+    reported_leaks: Optional[List[ReportedLeak]] = Field(
+        None,
+        description="Required when scenario_type='reported_leak'. Leak report(s) from the main system, validated against the network before the scenario is queued.",
+    )
+
+    demand_model: str = Field(
+        "DDA",
+        pattern="^(DDA|PDA)$",
+        description="Hydraulic demand model: 'DDA' (default) or 'PDA'.",
+    )
+    pda_pressure_min:      float = Field(0.0, ge=0)
+    pda_pressure_required: float = Field(0.1, gt=0)
+    pda_pressure_exponent: float = Field(0.5, gt=0)
+
+    overrides: Optional[DMAElementOverrides] = Field(
+        None,
+        description="Per-element parameter edits from the map inspector panel (pipes/sources/tanks/valves, keyed by fid), applied before the .inp is rebuilt for this run.",
+    )
+
+    @model_validator(mode="after")
+    def _check_scenario_contract(self):
+        try:
+            validate_scenario_contract(
+                scenario_type       = self.scenario_type,
+                leakage_frac        = self.leakage_frac,
+                has_reported_leaks  = bool(self.reported_leaks),
+            )
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return self
+
+
+
+@router.post("/{filename}/simulate", status_code=202)
+async def simulate_dma(
+    filename:   str,
+    body:       DMASimRequest,
+    background: BackgroundTasks,
+    db:         AsyncSession = Depends(get_db),
+    _:          str          = Depends(require_api_key),
+):
+    """Build a DMA EPANET model and queue a baseline hydraulic simulation."""
+    try:
+        dma = ingest_dma(filename, clip_to_dma=True)
+    except GpkgNotFoundError:
+        raise HTTPException(404, f"File not found: {filename}")
+    except InvalidGpkgError as e:
+        raise HTTPException(422, str(e))
+
+    if not dma.pipes:
+        raise HTTPException(422, "No operational pipes found in the DMA.")
+    if not dma.sources and not dma.tanks:
+        raise HTTPException(422, "No water sources or tanks found.")
+
+    try:
+        valve_status_overrides = _apply_dma_overrides(dma, body.overrides)
+    except Exception as e:
+        raise HTTPException(422, f"Couldn't apply element overrides: {e}")
+
+    import tempfile
+    inp_dir = tempfile.mkdtemp(prefix="dma_epyt_")
+    majiscope_metadata = _majiscope_metadata_for_file(filename)
+    uploaded_metadata, uploaded_inp_path = _prepared_uploaded_inp(filename)
+    uploaded_inp_filename = os.path.basename(uploaded_inp_path) if uploaded_inp_path else None
+
+    if uploaded_inp_path:
+        # MajiScope prepared this DMA from an uploaded EPANET model — that
+        # model is authoritative and must be simulated as provided.
+        inp_path = uploaded_inp_path
+        repair_report = None
+        connectors_geojson = {"type": "FeatureCollection", "features": []}
+    else:
+        try:
+            inp_path, repair_report = build_dma_inp(
+                dma             = dma,
+                inp_dir         = inp_dir,
+                duration_hrs    = body.duration_hrs,
+                time_step_min   = body.time_step_min,
+                base_demand_m3h = body.base_demand_m3h,
+                leakage_frac    = body.leakage_frac,
+                demand_model          = body.demand_model,
+                pda_pressure_min      = body.pda_pressure_min,
+                pda_pressure_required = body.pda_pressure_required,
+                pda_pressure_exponent = body.pda_pressure_exponent,
+                valve_status_overrides = valve_status_overrides,
+            )
+        except Exception as e:
+            logger.exception("DMA .inp build failed")
+            raise HTTPException(422, f"Failed to build EPANET model: {e}")
+
+    # Resolve + validate reported leak(s) against the network *before*
+    # queuing — a bad report should fail the request with a 422, not
+    # surface later as a FAILED scenario. resolve_and_validate_reports
+    # returns dicts already shaped for the worker's leak-event pipeline.
+    resolved_leaks: list = []
+    if body.scenario_type == REPORTED_LEAK:
+        try:
+            resolved_leaks = resolve_and_validate_reports(
+                body.reported_leaks, inp_path, body.duration_hrs * 3600
+            )
+        except LeakValidationError as e:
+            import shutil as _shutil
+            _shutil.rmtree(inp_dir, ignore_errors=True)
+            raise HTTPException(422, str(e))
+
+    if repair_report is not None:
+        connectors_geojson = _connectors_to_geojson(repair_report)
+
+    scenario = SimScenario(
+        gpkg_filename  = filename,
+        input_type     = "inp" if uploaded_inp_filename else "gpkg",
+        input_filename = uploaded_inp_filename,
+        name           = body.name,
+        description    = f"DMA baseline — {dma.dma_name}",
+        base_demand    = body.base_demand_m3h,
+        duration_hrs   = body.duration_hrs,
+        time_step_min  = body.time_step_min,
+        reservoir_head = 0.0,
+        demand_model          = body.demand_model,
+        pda_pressure_min      = body.pda_pressure_min,
+        pda_pressure_required = body.pda_pressure_required,
+        pda_pressure_exponent = body.pda_pressure_exponent,
+        scenario_type  = body.scenario_type,
+        leakage_frac   = body.leakage_frac,
+        extra_demands  = {
+            "_dma_inp_path":        inp_path,
+            "_dma_name":            dma.dma_name,
+            "_leakage_frac":        body.leakage_frac,
+            "_total_demand_m3h":    round(body.base_demand_m3h * (1 + body.leakage_frac), 6),
+            "_connectors_added":    len(repair_report.connectors_added) if repair_report else 0,
+            "_connector_length_m":  repair_report.total_connector_length_m if repair_report else 0,
+            "_original_components": repair_report.original_component_count if repair_report else None,
+            "_repair_warnings":     repair_report.warnings if repair_report else [],
+            "_dma_endpoint":        "baseline",
+            "_leak_events":         resolved_leaks,
+            "_majiscope":           majiscope_metadata,
+        },
+        status = "PENDING",
+    )
+    db.add(scenario)
+    await db.commit()
+    await db.refresh(scenario)
+
+    background.add_task(run_simulation_task, scenario.id)
+    logger.info(
+        "Queued DMA %s scenario %d for '%s'%s",
+        body.scenario_type, scenario.id, filename,
+        f" ({len(resolved_leaks)} reported leak(s))" if resolved_leaks else "",
+    )
+
+    return {
+        "id": scenario.id, "status": "PENDING",
+        "dma_name": dma.dma_name,
+        "input_type": scenario.input_type,
+        "topology_repair": {
+            "original_components":      repair_report.original_component_count if repair_report else None,
+            "connectors_added":         len(repair_report.connectors_added) if repair_report else 0,
+            "total_connector_length_m": repair_report.total_connector_length_m if repair_report else 0,
+            "warnings":                 repair_report.warnings if repair_report else [],
+            "connectors_geojson":       connectors_geojson,
+        },
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  POST /dma/{filename}/simulate/advanced  — full EPyT-Flow scenario
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class LeakageEventModel(BaseModel):
+    """One leakage event to inject."""
+    type:       str   = Field("abrupt_leakage", description="abrupt_leakage | incipient_leakage")
+    link_id:    str   = Field(..., description="EPANET pipe ID, e.g. E_42")
+    diameter:   float = Field(0.015, gt=0, description="Orifice diameter (m)")
+    start_time: int   = Field(0,     ge=0, description="Seconds from sim start")
+    end_time:   int   = Field(86400, ge=0)
+    peak_time:  Optional[int] = Field(None, description="Required for incipient_leakage")
+
+
+class SensorFaultModel(BaseModel):
+    """One sensor fault to apply."""
+    type:            str   = Field("sensor_fault")
+    fault_type:      str   = Field("gaussian", description="constant|drift|gaussian|percentage|stuck_zero")
+    sensor_id:       str   = Field(..., description="EPANET node/link ID")
+    sensor_type:     int   = Field(0, description="0=pressure, 1=flow")
+    start_time:      int   = Field(0)
+    end_time:        int   = Field(86400)
+    constant_shift:  Optional[float] = Field(None, description="For constant fault (m)")
+    coef:            Optional[float] = Field(None, description="For drift / percentage fault")
+    std:             Optional[float] = Field(None, description="For gaussian fault (m)")
+
+
+class ActuatorEventModel(BaseModel):
+    """One actuator event."""
+    type:        str   = Field(..., description="valve_state | pump_state | pump_speed")
+    valve_id:    Optional[str]   = None
+    pump_id:     Optional[str]   = None
+    valve_state: Optional[str]   = Field(None, description="open | closed")
+    pump_state:  Optional[str]   = Field(None, description="on | off")
+    pump_speed:  Optional[float] = Field(None, description="Speed ratio 0-2 (1=nominal)")
+    start_time:  int = Field(0)
+    end_time:    int = Field(86400)
+
+
+class ModelUncertaintyModel(BaseModel):
+    demand_pct:    float = Field(0.0, ge=0, le=1.0, description="± fraction on base demands")
+    roughness_pct: float = Field(0.0, ge=0, le=1.0, description="± fraction on H-W C")
+    seed:          int   = Field(42)
+
+
+class SensorNoiseModel(BaseModel):
+    pressure_noise_std: float = Field(0.0, ge=0, description="Gaussian std on pressure (m)")
+    flow_noise_std:     float = Field(0.0, ge=0, description="Gaussian std on flow (m³/h)")
+    seed:               int   = Field(42)
+
+
+class DMAAdvancedSimRequest(BaseModel):
+    name:             str   = Field("DMA advanced scenario", max_length=200)
+    duration_hrs:     int   = Field(24, ge=1, le=168)
+    time_step_min:    int   = Field(60, ge=5, le=360)
+    base_demand_m3h:  float = Field(0.011, gt=0)
+
+    # scenario_type contract (app/core/scenario_types.py). Both
+    # leakage_frac (random per-node leaks) and leakage_events (explicit
+    # EPyT-Flow link-based leaks) are synthetic/what-if injection tools
+    # and so are restricted the same way — research-mode only. A real
+    # leak reported by the main system goes through reported_leaks
+    # instead, which is validated against the network before queuing.
+    scenario_type: str = Field(
+        "baseline",
+        description=f"One of: {', '.join(sorted(ALL_SCENARIO_TYPES))}.",
+    )
+    leakage_frac: float = Field(
+        0.0, ge=0, le=1.0,
+        description="Research-only: fraction of nodes to receive a random synthetic leak event. Requires scenario_type='research'.",
+    )
+    reported_leaks: Optional[List[ReportedLeak]] = Field(
+        None,
+        description="Required when scenario_type='reported_leak'. Leak report(s) from the main system, validated against the network before the scenario is queued.",
+    )
+
+    demand_model: str = Field(
+        "DDA",
+        pattern="^(DDA|PDA)$",
+        description="Hydraulic demand model: 'DDA' (default) or 'PDA'.",
+    )
+    pda_pressure_min:      float = Field(0.0, ge=0)
+    pda_pressure_required: float = Field(0.1, gt=0)
+    pda_pressure_exponent: float = Field(0.5, gt=0)
+
+    # EPyT-Flow events
+    leakage_events:   List[LeakageEventModel]  = Field(default_factory=list)
+    sensor_faults:    List[SensorFaultModel]   = Field(default_factory=list)
+    actuator_events:  List[ActuatorEventModel] = Field(default_factory=list)
+
+    # EPyT-Flow uncertainties
+    model_uncertainty: Optional[ModelUncertaintyModel] = None
+    sensor_noise:      Optional[SensorNoiseModel]      = None
+
+    overrides: Optional[DMAElementOverrides] = Field(
+        None,
+        description="Per-element parameter edits from the map inspector panel (pipes/sources/tanks/valves, keyed by fid), applied before the .inp is rebuilt for this run.",
+    )
+
+    @model_validator(mode="after")
+    def _check_scenario_contract(self):
+        try:
+            validate_scenario_contract(
+                scenario_type            = self.scenario_type,
+                leakage_frac             = self.leakage_frac,
+                has_reported_leaks       = bool(self.reported_leaks),
+                has_explicit_leak_events = bool(self.leakage_events),
+            )
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return self
+
+
+@router.post("/{filename}/simulate/advanced", status_code=202)
+async def simulate_dma_advanced(
+    filename:   str,
+    body:       DMAAdvancedSimRequest,
+    background: BackgroundTasks,
+    db:         AsyncSession = Depends(get_db),
+    _:          str          = Depends(require_api_key),
+):
+    """
+    Full EPyT-Flow scenario for a DMA.
+
+    Supports all EPyT-Flow unique features:
+    - Abrupt / incipient leakage events
+    - Sensor faults (constant shift, drift, Gaussian noise, percentage error, stuck-at-zero)
+    - Actuator events (valve open/close, pump on/off, pump speed change)
+    - Model uncertainties (demand ±%, pipe roughness ±%)
+    - Sensor noise (additive Gaussian on SCADA readings)
+
+    Poll `GET /simulate/{id}` until DONE, then use the same result
+    endpoints as a baseline run.
+    """
+    try:
+        dma = ingest_dma(filename, clip_to_dma=True)
+    except GpkgNotFoundError:
+        raise HTTPException(404, f"File not found: {filename}")
+    except InvalidGpkgError as e:
+        raise HTTPException(422, str(e))
+
+    if not dma.pipes:
+        raise HTTPException(422, "No operational pipes found in the DMA.")
+
+    try:
+        valve_status_overrides = _apply_dma_overrides(dma, body.overrides)
+    except Exception as e:
+        raise HTTPException(422, f"Couldn't apply element overrides: {e}")
+
+    import tempfile
+    inp_dir = tempfile.mkdtemp(prefix="dma_adv_")
+    majiscope_metadata = _majiscope_metadata_for_file(filename)
+    uploaded_metadata, uploaded_inp_path = _prepared_uploaded_inp(filename)
+    uploaded_inp_filename = os.path.basename(uploaded_inp_path) if uploaded_inp_path else None
+
+    if uploaded_inp_path:
+        inp_path = uploaded_inp_path
+        repair_report = None
+    else:
+        try:
+            inp_path, repair_report = build_dma_inp(
+                dma             = dma,
+                inp_dir         = inp_dir,
+                duration_hrs    = body.duration_hrs,
+                time_step_min   = body.time_step_min,
+                base_demand_m3h = body.base_demand_m3h,
+                leakage_frac    = body.leakage_frac,
+                demand_model          = body.demand_model,
+                pda_pressure_min      = body.pda_pressure_min,
+                pda_pressure_required = body.pda_pressure_required,
+                pda_pressure_exponent = body.pda_pressure_exponent,
+                valve_status_overrides = valve_status_overrides,
+            )
+        except Exception as e:
+            logger.exception("DMA .inp build failed (advanced)")
+            raise HTTPException(422, f"Failed to build EPANET model: {e}")
+
+    # Resolve + validate reported leak(s) against the network before queuing.
+    resolved_leaks: list = []
+    if body.scenario_type == REPORTED_LEAK:
+        try:
+            resolved_leaks = resolve_and_validate_reports(
+                body.reported_leaks, inp_path, body.duration_hrs * 3600
+            )
+        except LeakValidationError as e:
+            import shutil as _shutil
+            _shutil.rmtree(inp_dir, ignore_errors=True)
+            raise HTTPException(422, str(e))
+
+    # Serialise all event dicts for storage in extra_demands
+    events_cfg = (
+        [e.model_dump() for e in body.leakage_events]
+        + [e.model_dump() for e in body.sensor_faults]
+        + [e.model_dump() for e in body.actuator_events]
+    )
+
+    scenario = SimScenario(
+        gpkg_filename  = filename,
+        input_type     = "inp" if uploaded_inp_filename else "gpkg",
+        input_filename = uploaded_inp_filename,
+        name           = body.name,
+        description    = f"DMA advanced EPyT-Flow scenario — {dma.dma_name}",
+        base_demand    = body.base_demand_m3h,
+        duration_hrs   = body.duration_hrs,
+        time_step_min  = body.time_step_min,
+        reservoir_head = 0.0,
+        demand_model          = body.demand_model,
+        pda_pressure_min      = body.pda_pressure_min,
+        pda_pressure_required = body.pda_pressure_required,
+        pda_pressure_exponent = body.pda_pressure_exponent,
+        scenario_type  = body.scenario_type,
+        leakage_frac   = body.leakage_frac,
+        extra_demands  = {
+            "_dma_inp_path":          inp_path,
+            "_dma_name":              dma.dma_name,
+            "_leakage_frac":          body.leakage_frac,
+            "_total_demand_m3h":      round(body.base_demand_m3h * (1 + body.leakage_frac), 6),
+            "_connectors_added":      len(repair_report.connectors_added) if repair_report else 0,
+            "_connector_length_m":    repair_report.total_connector_length_m if repair_report else 0,
+            "_original_components":   repair_report.original_component_count if repair_report else None,
+            "_repair_warnings":       repair_report.warnings if repair_report else [],
+            "_dma_endpoint":          "advanced",
+            "_events":                events_cfg,
+            "_model_uncertainty":     body.model_uncertainty.model_dump() if body.model_uncertainty else None,
+            "_sensor_noise":          body.sensor_noise.model_dump() if body.sensor_noise else None,
+            "_leak_events":           resolved_leaks,
+            "_majiscope":             majiscope_metadata,
+        },
+        status = "PENDING",
+    )
+    db.add(scenario)
+    await db.commit()
+    await db.refresh(scenario)
+
+    background.add_task(run_simulation_task, scenario.id)
+    logger.info(
+        "Queued DMA advanced scenario %d | scenario_type=%s reported_leaks=%d faults=%d actuators=%d",
+        scenario.id, body.scenario_type, len(resolved_leaks), len(body.sensor_faults), len(body.actuator_events),
+    )
+
+    return {
+        "id": scenario.id, "status": "PENDING",
+        "dma_name": dma.dma_name,
+        "events_queued": {
+            "leakage_events":   len(body.leakage_events),
+            "sensor_faults":    len(body.sensor_faults),
+            "actuator_events":  len(body.actuator_events),
+            "model_uncertainty": body.model_uncertainty is not None,
+            "sensor_noise":      body.sensor_noise is not None,
+        },
+        "input_type": scenario.input_type,
+        "topology_repair": {
+            "original_components":      repair_report.original_component_count if repair_report else None,
+            "connectors_added":         len(repair_report.connectors_added) if repair_report else 0,
+            "total_connector_length_m": repair_report.total_connector_length_m if repair_report else 0,
+            "warnings":                 repair_report.warnings if repair_report else [],
+            "connectors_geojson":       _connectors_to_geojson(repair_report) if repair_report else {"type": "FeatureCollection", "features": []},
+        },
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GET /dma/{filename}/simulate/{id}/nrw
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/{filename}/simulate/{scenario_id}/nrw")
+async def get_nrw(
+    filename:    str,
+    scenario_id: int,
+    db:          AsyncSession = Depends(get_db),
+    _:           str          = Depends(require_api_key),
+):
+    scenario = await db.get(SimScenario, scenario_id)
+    if not scenario or scenario.gpkg_filename != filename:
+        raise HTTPException(404, "Scenario not found.")
+    if scenario.status != "DONE":
+        raise HTTPException(409, f"Simulation is {scenario.status}, not DONE.")
+
+    summary      = scenario.summary or {}
+    extra        = scenario.extra_demands or {}
+    total_demand = extra.get("_total_demand_m3h", 0.011)
+    inlet_flow   = summary.get("inlet_flow_m3h", 0.0)
+    outlet_flow  = summary.get("outlet_flow_m3h", 0.0)
+    sim_demand   = summary.get("total_demand_m3h", total_demand)
+
+    if inlet_flow == 0.0:
+        inlet_flow = sim_demand
+
+    nrw = estimate_nrw(
+        inlet_flow_m3h   = inlet_flow,
+        total_demand_m3h = sim_demand,
+        outlet_flow_m3h  = outlet_flow,
+    )
+    return {
+        "scenario_id": scenario_id,
+        "dma_name":    extra.get("_dma_name"),
+        "simulation_summary": summary,
+        "nrw": nrw,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GET /dma/{filename}/simulate/{id}/leakage
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/{filename}/simulate/{scenario_id}/leakage")
+async def get_leakage_report(
+    filename:    str,
+    scenario_id: int,
+    db:          AsyncSession = Depends(get_db),
+    _:           str          = Depends(require_api_key),
+):
+    scenario = await db.get(SimScenario, scenario_id)
+    if not scenario or scenario.gpkg_filename != filename:
+        raise HTTPException(404, "Scenario not found.")
+    if scenario.status != "DONE":
+        raise HTTPException(409, f"Simulation is {scenario.status}, not DONE.")
+    if not (scenario.extra_demands or {}).get("_dma_inp_path"):
+        raise HTTPException(422, "Not a DMA simulation.")
+
+    from sqlalchemy import select as sa_select
+    from app.services.simulation_service import NodeResult, PipeResult, SimulationOutput
+
+    rows = (await db.execute(
+        sa_select(SimResult).where(SimResult.scenario_id == scenario_id)
+    )).scalars().all()
+
+    node_results, pipe_results = [], []
+    for sr in rows:
+        d = sr.data if hasattr(sr, "data") else {}
+        if sr.element_type == "node":
+            node_results.append(NodeResult(
+                element_id = sr.element_id, time_step = sr.time_step,
+                lat = sr.lat, lon = sr.lon,
+                pressure = sr.pressure, head = sr.head,
+                demand   = sr.demand, water_age = sr.water_age,
+                is_low_pressure = sr.is_low_pressure,
+            ))
+        elif sr.element_type == "pipe":
+            pipe_results.append(PipeResult(
+                element_id = sr.element_id, time_step = sr.time_step,
+                lat = sr.lat, lon = sr.lon,
+                flow_rate  = sr.flow_rate, velocity = sr.velocity,
+                headloss   = sr.headloss, is_high_velocity = sr.is_high_velocity,
+            ))
+
+    # scenario.summary carries the real values captured at run time
+    # (pressure_avg_m, time_steps, duration_hrs, the EPANET .rpt flow
+    # balance, and real per-pipe diameters) — the .inp file itself is long
+    # gone by the time this report is requested, so this is the only place
+    # those figures can still come from. Without it, analyse_leakage()
+    # would silently fall back to hardcoded defaults (20m pressure, 1
+    # timestep, 24hr duration, 50mm pipes) regardless of the actual run.
+    scenario_summary = scenario.summary or {}
+    sim_output = SimulationOutput(
+        node_results = node_results,
+        pipe_results = pipe_results,
+        summary      = scenario_summary,
+    )
+    extra  = scenario.extra_demands or {}
+    report = analyse_leakage(
+        output              = sim_output,
+        scenario_id         = scenario_id,
+        dma_name            = extra.get("_dma_name", "DMA"),
+        base_demand_m3h     = scenario.base_demand or 0.011,
+        leakage_frac        = extra.get("_leakage_frac", 0.20),
+        pipe_diam_mm        = scenario_summary.get("pipe_diam_mm", {}),
+        epanet_flow_balance = scenario_summary.get("epanet_flow_balance"),
+    )
+
+    return {
+        "scenario_id": scenario_id,
+        "dma_name":    report.dma_name,
+        "warnings":    report.warnings,
+        "nrw": {
+            "system_input_m3h":  report.nrw.system_input_m3h,
+            "authorised_m3h":    report.nrw.authorised_m3h,
+            "nrw_m3h":           report.nrw.nrw_m3h,
+            "nrw_pct":           report.nrw.nrw_pct,
+            "real_loss_m3h":     report.nrw.real_loss_m3h,
+            "apparent_loss_m3h": report.nrw.apparent_loss_m3h,
+            "ili":               report.nrw.ili,
+            "source":            report.nrw.source,
+        },
+        "pressure_zones": [
+            {"zone": z.zone, "count": z.count, "pct": z.avg_pct,
+             "node_ids": z.node_ids[:20]} for z in report.pressure_zones
+        ],
+        "pipe_risks_top20": [
+            {"pipe_id": r.pipe_id, "lat": r.lat, "lon": r.lon,
+             "risk_score": r.risk_score, "risk_level": r.risk_level,
+             "drivers": r.drivers, "avg_flow": r.avg_flow,
+             "min_pressure_adjacent": r.min_pressure_adjacent}
+            for r in report.pipe_risks[:20]
+        ],
+        "hotspots_geojson":  report.hotspots,
+        "timestep_balance": [
+            {"hour": b.hour, "inflow_m3h": b.inflow_m3h,
+             "demand_m3h": b.demand_m3h, "nrw_m3h": b.nrw_m3h}
+            for b in report.timestep_balance
+        ],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GET /dma/{filename}/simulate/{id}/tanks  — tank volume time-series
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/{filename}/simulate/{scenario_id}/tanks")
+async def get_tank_volumes(
+    filename:    str,
+    scenario_id: int,
+    db:          AsyncSession = Depends(get_db),
+    _:           str          = Depends(require_api_key),
+):
+    """
+    Return tank water-volume time-series for a completed DMA simulation.
+    """
+    scenario = await db.get(SimScenario, scenario_id)
+    if not scenario or scenario.gpkg_filename != filename:
+        raise HTTPException(404, "Scenario not found.")
+    if scenario.status != "DONE":
+        raise HTTPException(409, f"Simulation is {scenario.status}, not DONE.")
+
+    rows = (await db.execute(
+        select(SimResult).where(
+            SimResult.scenario_id == scenario_id,
+            SimResult.element_type == "tank",
+        ).order_by(SimResult.element_id, SimResult.time_step)
+    )).scalars().all()
+
+    by_tank: Dict[str, list] = {}
+    for r in rows:
+        by_tank.setdefault(r.element_id, []).append({
+            "hour": r.time_step,
+            "volume_m3": r.volume_m3 if hasattr(r, "volume_m3") else None,
+        })
+
+    return {
+        "scenario_id": scenario_id,
+        "dma_name":    (scenario.extra_demands or {}).get("_dma_name"),
+        "tanks":       [{"tank_id": tid, "series": series}
+                        for tid, series in sorted(by_tank.items())],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _connectors_to_geojson(repair_report) -> dict:
+    return {
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature",
+             "geometry": {"type": "LineString",
+                          "coordinates": [list(c.from_lonlat), list(c.to_lonlat)]},
+             "properties": {"id": c.connector_id, "length_m": c.length_m,
+                            "diam_mm": c.diam_mm, "material": c.material,
+                            "reason": c.reason}}
+            for c in repair_report.connectors_added
+        ],
+    }

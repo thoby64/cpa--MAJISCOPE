@@ -1,0 +1,84 @@
+from app.api.reports import _report_classification, _report_type_value
+from datetime import datetime, timedelta
+
+from app.models.business import Report, ReportTypeEnum
+from app.schemas.business import AnonymousReportCreate
+
+
+def test_non_leakage_report_persists_null_leakage_type(db) -> None:
+    report = Report(
+        tracking_id="ANON-NON-LEAKAGE-TEST",
+        description="Test report",
+        latitude=0,
+        longitude=0,
+        report_type=ReportTypeEnum.NON_LEAKAGE.value,
+        leakage_type=None,
+        reporter_name="Test reporter",
+        reporter_phone="N/A",
+        sla_deadline=datetime.utcnow() + timedelta(days=7),
+    )
+    db.add(report)
+    db.flush()
+
+    assert report.leakage_type is None
+
+
+def test_legacy_report_defaults_to_leakage_unknown() -> None:
+    assert _report_classification(None, None) == ("leakage", "unknown")
+
+
+def test_non_leakage_report_always_clears_leakage_type() -> None:
+    assert _report_classification("non_leakage", "pipe_burst") == ("non_leakage", None)
+
+
+def test_report_type_normalizer_accepts_display_alias() -> None:
+    assert _report_type_value("non-leakage") == ReportTypeEnum.NON_LEAKAGE.value
+
+
+def test_mobile_payload_accepts_canonical_non_leakage_type() -> None:
+    payload = AnonymousReportCreate(
+        description="Storage storage_facility has no water",
+        latitude=-6.1,
+        longitude=35.7,
+        report_type="non_leakage",
+        leakage_type="overflow",
+    )
+    assert payload.report_type.value == "non_leakage"
+    assert payload.leakage_type is None
+
+
+def test_mobile_payload_keeps_high_priority_input() -> None:
+    payload = AnonymousReportCreate(
+        description="No water at the storage storage_facility",
+        latitude=-6.1,
+        longitude=35.7,
+        priority="High",
+        report_type="non_leakage",
+        leakage_type=None,
+    )
+    assert payload.priority == "High"
+
+
+def test_report_list_accepts_reports_without_utility(client, db, admin_auth_headers) -> None:
+    report = Report(
+        tracking_id="UNASSIGNED-UTILITY-TEST",
+        description="Unassigned report with map coordinates",
+        latitude=-6.1,
+        longitude=35.7,
+        leakage_type="unknown",
+        utility_id=None,
+        reporter_name="Test reporter",
+        reporter_phone="N/A",
+        sla_deadline=datetime.utcnow() + timedelta(days=7),
+    )
+    db.add(report)
+    db.commit()
+
+    response = client.get(
+        "/api/reports?has_coordinates=true&limit=500&skip=0",
+        headers=admin_auth_headers,
+    )
+
+    assert response.status_code == 200
+    item = next(item for item in response.json()["items"] if item["id"] == report.id)
+    assert item["utility_id"] is None

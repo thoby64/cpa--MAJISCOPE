@@ -1,0 +1,365 @@
+"""
+Majiscope Backend - Main Entry Point
+FastAPI application initialization and route registration
+"""
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from contextlib import asynccontextmanager
+import asyncio
+
+from app.config import settings
+from app.database.session import engine, SessionLocal
+from app.middleware import LoggingMiddleware, RequestIDMiddleware, RateLimitMiddleware, register_exception_handlers
+from app.models import Base
+from app.api import (
+    auth_router,
+    users_router,
+    utilities_router,
+    dmas_router,
+    teams_router,
+    engineers_router,
+    reports_router,
+    utility_managers_router,
+    dma_managers_router,
+    notifications_router,
+    push_tokens_router,
+    logs_router,
+    health_router,
+    uploads_router,
+    hydraulic_model_router,
+    dashboard_router,
+    sensors_router,
+    storage_facility_sensors_router,
+    storage_facilities_router,
+    water_sources_router,
+    water_source_sensors_router,
+    infrastructure_templates_router,
+)
+from app.services.database_migrations import run_heavy_startup_migrations, run_safe_startup_migrations
+from app.services.storage_facility_migrations import migrate_storage_facility_schema
+from import_legacy_duwasa_reports import DEFAULT_CSV_PATH, import_legacy_duwasa_data
+
+# ============================================================
+# Lifecycle Events
+# ============================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Handle startup and shutdown events
+    """
+    print("=" * 60)
+    print(f"🚀 {settings.app_name} v{settings.app_version} Starting...")
+    print(f"   Environment: {settings.environment}")
+    print(f"   Backend URL: http://{settings.host}:{settings.port}")
+    print(f"   Frontend URL: {settings.frontend_url}")
+    print(f"   CORS Origins: {settings.get_cors_origins()}")
+    print(f"   CORS Origin Regex: {settings.cors_origin_regex}")
+    print(f"   Startup Migrations Enabled: {settings.run_startup_migrations}")
+    print(f"   Heavy Startup Migrations Enabled: {settings.run_startup_migrations}")
+    startup_all_database_schema_sync_enabled = settings.run_startup_all_database_schema_sync
+    startup_schema_sync_enabled = (
+        settings.run_startup_schema_sync
+        and not engine.dialect.name.startswith("postgresql")
+    )
+    print(f"   Startup Schema Sync Enabled: {startup_schema_sync_enabled}")
+    print(f"   Startup All-Database Schema Sync Enabled: {startup_all_database_schema_sync_enabled}")
+    if (
+        settings.run_startup_schema_sync
+        and not startup_schema_sync_enabled
+        and not startup_all_database_schema_sync_enabled
+    ):
+        print("   Startup Schema Sync Skipped: disabled for PostgreSQL web startup")
+    print(f"   Legacy DUWASA Startup Import: {settings.legacy_duwasa_import_on_startup}")
+    print("=" * 60)
+    from app.database.sensor_session import sensor_engine
+
+    migrate_storage_facility_schema(engine)
+    migrate_storage_facility_schema(sensor_engine, sensor_platform=True)
+    if settings.run_startup_migrations:
+        run_safe_startup_migrations(engine)
+        run_heavy_startup_migrations(engine)
+    if startup_all_database_schema_sync_enabled:
+        from app.services.startup_schema_sync import sync_startup_database_schemas
+
+        print("   Synchronously ensuring ORM schemas exist in both databases")
+        sync_startup_database_schemas(engine, sensor_engine)
+    if startup_schema_sync_enabled and not startup_all_database_schema_sync_enabled:
+        Base.metadata.create_all(bind=engine)
+
+    media_schema_ready = asyncio.Event()
+    if not settings.media_backfill_on_startup or settings.environment != "production":
+        media_schema_ready.set()
+    lifespan_loop = asyncio.get_running_loop()
+
+    def run_media_backfill():
+        from sqlalchemy import text
+
+        lock_connection = None
+        lock_acquired = False
+        try:
+            if engine.dialect.name == "postgresql":
+                lock_connection = engine.connect()
+                lock_connection.execute(text("SELECT pg_advisory_lock(731942011)"))
+                lock_connection.commit()
+                lock_acquired = True
+
+            from app.services.database_migrations import ensure_media_object_storage_schema
+            from app.services.media_storage_migration import migrate_report_media
+
+            print("   Report media object storage migration started")
+            ensure_media_object_storage_schema(engine)
+            lifespan_loop.call_soon_threadsafe(media_schema_ready.set)
+            with SessionLocal() as media_db:
+                result = migrate_report_media(media_db, purge_binary=True)
+            print("   Report media object storage migration complete:", result)
+        except Exception as exc:
+            print(f"   Report media object storage migration failed: {exc}")
+            if settings.environment != "production":
+                raise
+        finally:
+            if lock_connection is not None:
+                if lock_acquired:
+                    lock_connection.execute(text("SELECT pg_advisory_unlock(731942011)"))
+                    lock_connection.commit()
+                lock_connection.close()
+
+    media_backfill_task = None
+    if settings.media_backfill_on_startup:
+        if settings.environment == "production":
+            print("   Report media backfill enabled; running after startup in the background")
+            media_backfill_task = asyncio.create_task(asyncio.to_thread(run_media_backfill))
+        else:
+            run_media_backfill()
+
+    async def media_deletion_worker():
+        if settings.media_backfill_on_startup and settings.environment == "production":
+            await media_schema_ready.wait()
+        while True:
+            try:
+                from app.services.media_storage_cleanup import drain_media_deletion_queue
+                await asyncio.to_thread(drain_media_deletion_queue)
+            except Exception as exc:
+                print(f"Media object deletion queue drain failed: {exc}")
+            await asyncio.sleep(30)
+
+    media_worker_task = asyncio.create_task(media_deletion_worker())
+
+    def run_optional_startup_syncs():
+        # ── Sensor platform DB: ensure tables, drain mirror backlog ────────
+        try:
+            from app.database.sensor_session import sensor_engine
+            from app.models.sensor_platform import SensorBase
+            from app.services.sensor_platform_sync import (
+                drain_outbox,
+                ensure_outbox_table,
+                reconcile_all_storage_facilities,
+                reconcile_all_water_sources,
+            )
+
+            if settings.run_startup_schema_sync and not startup_all_database_schema_sync_enabled:
+                SensorBase.metadata.create_all(bind=sensor_engine)
+            with SessionLocal() as boot_db:
+                if settings.run_startup_migrations or startup_schema_sync_enabled:
+                    ensure_outbox_table(boot_db)
+                    boot_db.commit()
+                if settings.run_sensor_platform_startup_reconcile:
+                    drained = drain_outbox(boot_db)
+                    if drained:
+                        print(f"   Sensor mirror outbox drained: {drained} entr(y/ies)")
+                    result = reconcile_all_storage_facilities(boot_db)
+                    print(
+                        f"   Sensor platform storage_facility mirror: {result['mirrored']}/{result['total']} storage_facility(s) in sync"
+                    )
+                    source_result = reconcile_all_water_sources(boot_db)
+                    print(
+                        f"   Sensor platform water-source mirror: "
+                        f"{source_result['mirrored']}/{source_result['total']} source(s) in sync"
+                    )
+                else:
+                    print("   Sensor platform startup reconciliation disabled by configuration")
+        except Exception as exc:
+            print(f"   Sensor platform startup sync failed (non-fatal): {exc}")
+
+        if settings.run_storage_facility_gpkg_sync_on_startup:
+            from app.services.gpkg_startup_sync import (
+                run_storage_facility_gpkg_sync_on_startup,
+                run_water_source_gpkg_sync_on_startup,
+            )
+
+            try:
+                with SessionLocal() as sync_db:
+                    run_storage_facility_gpkg_sync_on_startup(sync_db)
+                    run_water_source_gpkg_sync_on_startup(sync_db)
+            except Exception as exc:
+                print(f"StorageFacility GPKG startup sync failed: {exc}")
+
+    if settings.legacy_duwasa_import_on_startup:
+        csv_path = (
+            settings.legacy_duwasa_import_csv_path.strip()
+            or str(DEFAULT_CSV_PATH)
+        )
+        try:
+            import_legacy_duwasa_data(
+                database_url=settings.database_url,
+                csv_path=csv_path,
+                limit=settings.legacy_duwasa_import_limit,
+                execute=True,
+            )
+        except Exception as exc:
+            print(f"Legacy DUWASA startup import failed: {exc}")
+            if settings.legacy_duwasa_import_strict:
+                raise
+    startup_sync_task = None
+    if settings.environment == "production":
+        startup_sync_task = asyncio.create_task(asyncio.to_thread(run_optional_startup_syncs))
+    else:
+        run_optional_startup_syncs()
+    yield
+    media_worker_task.cancel()
+    try:
+        await media_worker_task
+    except asyncio.CancelledError:
+        pass
+    print("=" * 60)
+    print(f"🛑 {settings.app_name} Shutting Down...")
+    print("=" * 60)
+
+
+# ============================================================
+# FastAPI Application
+# ============================================================
+
+app = FastAPI(
+    title=settings.app_name,
+    version=settings.app_version,
+    description="Water Leakage Management System - Backend API",
+    lifespan=lifespan,
+)
+
+# Serialise all API datetimes as explicit UTC (Z suffix). The app stores naive
+# UTC values; without this clients read them as local time and display the
+# wrong hour.
+from app.utils.tz_serialization import install_utc_datetime_serialization
+
+install_utc_datetime_serialization()
+
+# ============================================================
+# Global Middleware & Exception Handlers
+# ============================================================
+
+# Add custom middleware to the FastAPI application.
+app.add_middleware(RateLimitMiddleware, requests_per_minute=100)
+app.add_middleware(RequestIDMiddleware)
+app.add_middleware(LoggingMiddleware)
+
+# Register global exception handlers
+register_exception_handlers(app)
+
+# ============================================================
+# API Routes
+# ============================================================
+
+# Register all API routers
+app.include_router(auth_router)
+app.include_router(users_router)
+app.include_router(utilities_router)
+app.include_router(dmas_router)
+app.include_router(teams_router)
+app.include_router(engineers_router)
+app.include_router(reports_router)
+app.include_router(utility_managers_router)
+app.include_router(dma_managers_router)
+app.include_router(notifications_router)
+app.include_router(push_tokens_router)
+app.include_router(logs_router)
+app.include_router(health_router)
+app.include_router(uploads_router)
+app.include_router(hydraulic_model_router)
+app.include_router(dashboard_router)
+app.include_router(sensors_router)
+app.include_router(storage_facility_sensors_router)
+app.include_router(storage_facilities_router)
+app.include_router(water_sources_router)
+app.include_router(water_source_sensors_router)
+app.include_router(infrastructure_templates_router)
+
+# ============================================================
+# Health Check & Status Endpoints
+# ============================================================
+# Health check endpoints are provided by health_router
+# See app/api/health.py for detailed health checks
+
+
+@app.get("/", tags=["root"])
+async def root():
+    """
+    Root endpoint
+    Returns API information
+    """
+    return {
+        "message": f"Welcome to {settings.app_name}",
+        "version": settings.app_version,
+        "docs": f"http://{settings.host}:{settings.port}/docs",
+        "api_prefix": settings.api_prefix,
+    }
+
+
+@app.get("/api", tags=["root"])
+async def api_root():
+    """
+    API root endpoint
+    Returns information about available endpoints
+    """
+    return {
+        "message": "Majiscope API",
+        "version": settings.app_version,
+        "endpoints": {
+            "auth": f"{settings.api_prefix}/auth",
+            "users": f"{settings.api_prefix}/users",
+            "utilities": f"{settings.api_prefix}/utilities",
+            "dmas": f"{settings.api_prefix}/dmas",
+            "teams": f"{settings.api_prefix}/teams",
+            "engineers": f"{settings.api_prefix}/engineers",
+            "reports": f"{settings.api_prefix}/reports",
+            "dma_managers": f"{settings.api_prefix}/dma-managers",
+            "utility_managers": f"{settings.api_prefix}/utility-managers",
+            "notifications": f"{settings.api_prefix}/notifications",
+            "push_tokens": f"{settings.api_prefix}/push-tokens",
+            "logs": f"{settings.api_prefix}/logs",
+        },
+        "documentation": "/docs",
+        "openapi_schema": "/openapi.json",
+    }
+
+
+# Wrap the complete FastAPI stack so CORS headers are also added to unhandled
+# error responses generated by Starlette's outer ServerErrorMiddleware.
+fastapi_app = app
+app = CORSMiddleware(
+    app=fastapi_app,
+    allow_origins=settings.get_cors_origins(),
+    allow_origin_regex=settings.cors_origin_regex,
+    allow_credentials=settings.cors_credentials,
+    allow_methods=settings.cors_allow_methods,
+    allow_headers=settings.cors_allow_headers,
+    max_age=86400,
+)
+
+
+# ============================================================
+# Entry Point
+# ============================================================
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "app.main:app",
+        host=settings.host,
+        port=settings.port,
+        reload=settings.debug,
+        log_level="info",
+    )

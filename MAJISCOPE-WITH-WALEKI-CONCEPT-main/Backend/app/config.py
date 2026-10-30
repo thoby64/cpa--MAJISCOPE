@@ -1,0 +1,265 @@
+"""
+Global Backend Configuration
+Centralized environment and application settings
+"""
+
+import os
+from typing import Any, List
+from urllib.parse import urlsplit
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+RUNTIME_ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower()
+SETTINGS_ENV_FILE = None if RUNTIME_ENVIRONMENT == "production" else ".env"
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables"""
+
+    model_config = SettingsConfigDict(
+        env_file=SETTINGS_ENV_FILE,
+        case_sensitive=False,
+        extra="ignore",
+    )
+    
+    # ===== Application Settings =====
+    app_name: str = "Majiscope Backend"
+    app_version: str = "1.0.0"
+    environment: str = Field(default="development", alias="ENVIRONMENT")
+    debug: bool = Field(default=False, alias="DEBUG")
+
+    # ===== Database Settings =====
+    database_url: str = Field(
+        default="postgresql+psycopg://user:password@localhost:5432/majiscope",
+        alias="DATABASE_URL",
+    )
+    # Separate store for sensor telemetry (readings) and the sensor registry.
+    # Treated as a remote host; may point at the same Postgres server.
+    sensor_database_url: str = Field(
+        default="postgresql+psycopg://user:password@localhost:5432/sensor_platform",
+        alias="SENSOR_DATABASE_URL",
+    )
+
+    # ===== Report media object storage =====
+    media_storage_backend: str = Field(default="local", alias="MEDIA_STORAGE_BACKEND")
+    media_storage_path: str = Field(default=".media_objects", alias="MEDIA_STORAGE_PATH")
+    media_storage_api_url: str = Field(default="", alias="MEDIA_STORAGE_API_URL")
+    media_storage_api_key: str = Field(default="", alias="MEDIA_STORAGE_API_KEY")
+    # Legacy S3 source settings remain available for the one-time Garage migration.
+    media_s3_bucket: str = Field(default="", alias="MEDIA_S3_BUCKET")
+    media_s3_region: str = Field(default="", alias="MEDIA_S3_REGION")
+    media_s3_endpoint_url: str = Field(default="", alias="MEDIA_S3_ENDPOINT_URL")
+    media_s3_access_key_id: str = Field(default="", alias="MEDIA_S3_ACCESS_KEY_ID")
+    media_s3_secret_access_key: str = Field(default="", alias="MEDIA_S3_SECRET_ACCESS_KEY")
+    media_s3_session_token: str = Field(default="", alias="MEDIA_S3_SESSION_TOKEN")
+    media_s3_addressing_style: str = Field(default="auto", alias="MEDIA_S3_ADDRESSING_STYLE")
+    media_s3_sse: str = Field(default="", alias="MEDIA_S3_SSE")
+    media_s3_kms_key_id: str = Field(default="", alias="MEDIA_S3_KMS_KEY_ID")
+    # One-time-compatible, idempotent migration of legacy report media on boot.
+    # Keep opt-in so large or remote deployments can run the migration as a job.
+    media_backfill_on_startup: bool = Field(default=False, alias="MEDIA_BACKFILL_ON_STARTUP")
+
+    # ===== Security Settings =====
+    secret_key: str = Field(
+        default="your-secret-key-change-in-production-12345",
+        alias="SECRET_KEY",
+    )
+    algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60
+    refresh_token_expire_days: int = 7
+
+    # ===== Frontend Configuration =====
+    # IMPORTANT: This is used for CORS and rendering frontend URLs
+    frontend_url: str = Field(default="http://localhost:3000", alias="FRONTEND_URL")
+    public_backend_url: str = Field(default="", alias="PUBLIC_BACKEND_URL")
+    cors_origins_raw: str = Field(default="", alias="CORS_ORIGINS")
+    cors_origin_regex: str = Field(
+        default=r"^https:\/\/.*\.onrender\.com$",
+        alias="CORS_ORIGIN_REGEX",
+    )
+    
+    # ===== CORS Settings =====
+    default_cors_origins: List[str] = [
+        "http://localhost:3000",      # Development frontend
+        "http://127.0.0.1:3000",      # Alternative localhost
+        "http://192.168.1.2:8081",    # Expo development server
+        "http://10.0.2.2:8081",       # Android emulator
+        "exp://192.168.1.2:8081",     # Expo Go app
+        "exp://10.0.2.2:8081",        # Expo Go on Android emulator
+    ]
+    cors_credentials: bool = True
+    cors_allow_methods: List[str] = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
+    cors_allow_headers: List[str] = ["*"]
+
+    # ===== Invitation & Email Settings =====
+    invite_token_expiry_hours: int = Field(default=72, alias="INVITE_TOKEN_EXPIRY_HOURS")
+    password_reset_token_expiry_hours: int = Field(default=2, alias="PASSWORD_RESET_TOKEN_EXPIRY_HOURS")
+    resend_api_key: str = Field(default="", alias="RESEND_API_KEY")
+    resend_from_email: str = Field(default="", alias="RESEND_FROM_EMAIL")
+    resend_from_name: str = Field(default="Majiscope", alias="RESEND_FROM_NAME")
+    smtp_host: str = Field(default="", alias="SMTP_HOST")
+    smtp_port: int = Field(default=587, alias="SMTP_PORT")
+    smtp_username: str = Field(default="", alias="SMTP_USERNAME")
+    smtp_password: str = Field(default="", alias="SMTP_PASSWORD")
+    smtp_from_email: str = Field(default="", alias="SMTP_FROM_EMAIL")
+    smtp_from_name: str = Field(default="Majiscope", alias="SMTP_FROM_NAME")
+    smtp_use_tls: bool = Field(default=True, alias="SMTP_USE_TLS")
+
+    # ===== Password Hashing =====
+    password_hash_algorithm: str = "bcrypt"
+    password_bcrypt_rounds: int = 12
+
+    # ===== API Settings =====
+    api_prefix: str = "/api"
+
+    # ===== Hydraulic Model Integration =====
+    # HYDRAULIC_MODEL_BASE_URL holds the service-to-service base URL(s) used by
+    # the backend to talk to the hydraulic model service. It accepts a
+    # comma-separated list that is tried in order, so a Render private-network
+    # (internal) address can be preferred over the public edge URL.
+    hydraulic_model_base_url: str = Field(default="", alias="HYDRAULIC_MODEL_BASE_URL")
+    # Browser-facing base URL of the hydraulic model service. It is used to
+    # build the launch link the user opens, and therefore must stay publicly
+    # reachable even when the backend calls the service over a private address.
+    hydraulic_model_public_url: str = Field(default="", alias="HYDRAULIC_MODEL_PUBLIC_URL")
+    hydraulic_model_api_key: str = Field(default="", alias="HYDRAULIC_MODEL_API_KEY")
+    hydraulic_model_launch_secret: str = Field(default="", alias="HYDRAULIC_MODEL_LAUNCH_SECRET")
+    hydraulic_model_callback_secret: str = Field(default="", alias="HYDRAULIC_MODEL_CALLBACK_SECRET")
+    hydraulic_model_temp_ttl_hours: int = Field(default=24, alias="HYDRAULIC_MODEL_TEMP_TTL_HOURS")
+
+    # ===== Sensor Ingest =====
+    # Shared secret accepted via the X-Ingest-Key header for device ingest.
+    # Empty (default) disables key-based ingest; authenticated users still work.
+    sensor_ingest_key: str = Field(default="", alias="SENSOR_INGEST_KEY")
+    
+    # ===== Server Settings =====
+    host: str = Field(default="0.0.0.0", alias="HOST")
+    port: int = Field(default=8000, alias="PORT")
+
+    # ===== Runtime database startup behavior =====
+    run_startup_migrations: bool = Field(default=True, alias="RUN_STARTUP_MIGRATIONS")
+    run_startup_schema_sync: bool = Field(default=True, alias="RUN_STARTUP_SCHEMA_SYNC")
+    run_startup_all_database_schema_sync: bool = Field(
+        default=False,
+        alias="RUN_STARTUP_ALL_DATABASE_SCHEMA_SYNC",
+    )
+    run_sensor_platform_startup_reconcile: bool = Field(default=True, alias="RUN_SENSOR_PLATFORM_STARTUP_RECONCILE")
+
+    # ===== Optional startup import =====
+    legacy_duwasa_import_on_startup: bool = Field(default=False, alias="LEGACY_DUWASA_IMPORT_ON_STARTUP")
+    legacy_duwasa_import_csv_path: str = Field(default="", alias="LEGACY_DUWASA_IMPORT_CSV_PATH")
+    legacy_duwasa_import_strict: bool = Field(default=False, alias="LEGACY_DUWASA_IMPORT_STRICT")
+    legacy_duwasa_import_limit: int | None = Field(default=None, alias="LEGACY_DUWASA_IMPORT_LIMIT")
+
+    # ===== Optional GPKG storage_facility sync on startup =====
+    run_storage_facility_gpkg_sync_on_startup: bool = Field(default=True, alias="RUN_STORAGE_FACILITY_GPKG_SYNC_ON_STARTUP")
+
+    @field_validator("debug", mode="before")
+    @classmethod
+    def parse_debug_value(cls, value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on", "debug", "development"}:
+                return True
+            if normalized in {"0", "false", "no", "off", "release", "production"}:
+                return False
+        return bool(value)
+
+    @field_validator(
+        "smtp_use_tls",
+        "run_startup_migrations",
+        "run_startup_schema_sync",
+        "run_startup_all_database_schema_sync",
+        "run_sensor_platform_startup_reconcile",
+        "media_backfill_on_startup",
+        "legacy_duwasa_import_on_startup",
+        "legacy_duwasa_import_strict",
+        "run_storage_facility_gpkg_sync_on_startup",
+        mode="before",
+    )
+    @classmethod
+    def parse_boolean_values(cls, value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @model_validator(mode="after")
+    def normalize_runtime_fields(self) -> "Settings":
+        self.environment = self.environment.strip().lower()
+        self.media_storage_backend = self.media_storage_backend.strip().lower()
+        self.media_storage_api_url = self.media_storage_api_url.strip().rstrip("/")
+        self.media_storage_api_key = self.media_storage_api_key.strip()
+        self.media_s3_region = self.media_s3_region.strip()
+        self.public_backend_url = self.public_backend_url.rstrip("/")
+        self.hydraulic_model_base_url = ",".join(
+            part.strip().rstrip("/")
+            for part in self.hydraulic_model_base_url.split(",")
+            if part.strip()
+        )
+        self.hydraulic_model_public_url = self.hydraulic_model_public_url.strip().rstrip("/")
+        if self.environment == "production" and "frontend_url" not in self.__pydantic_fields_set__:
+            self.frontend_url = ""
+        if self.environment == "production":
+            self.run_startup_migrations = False
+            self.run_startup_schema_sync = False
+            if self.media_storage_backend != "http":
+                raise ValueError("Production requires MEDIA_STORAGE_BACKEND=http")
+        if self.media_storage_backend not in {"local", "http", "s3"}:
+            raise ValueError("MEDIA_STORAGE_BACKEND must be 'local', 'http', or 's3'")
+        if self.media_storage_backend == "http":
+            if not self.media_storage_api_url.strip():
+                raise ValueError("MEDIA_STORAGE_API_URL is required when MEDIA_STORAGE_BACKEND=http")
+            if not self.media_storage_api_key.strip():
+                raise ValueError("MEDIA_STORAGE_API_KEY is required when MEDIA_STORAGE_BACKEND=http")
+            storage_url = urlsplit(self.media_storage_api_url)
+            if (
+                storage_url.scheme not in {"http", "https"}
+                or not storage_url.hostname
+                or storage_url.query
+                or storage_url.fragment
+            ):
+                raise ValueError("MEDIA_STORAGE_API_URL must be a base HTTP(S) URL")
+        if self.media_storage_backend == "s3" and not self.media_s3_bucket.strip():
+            raise ValueError("MEDIA_S3_BUCKET is required when MEDIA_STORAGE_BACKEND=s3")
+        if "debug" not in self.__pydantic_fields_set__:
+            self.debug = self.environment == "development"
+        if self.environment != "production" and "run_startup_migrations" not in self.__pydantic_fields_set__:
+            self.run_startup_migrations = self.environment != "production"
+        if self.environment != "production" and "run_startup_schema_sync" not in self.__pydantic_fields_set__:
+            self.run_startup_schema_sync = self.environment != "production"
+        return self
+
+    def get_cors_origins(self) -> List[str]:
+        """
+        Get all CORS origins including frontend_url
+        Ensures frontend is always allowed
+        """
+        configured_origins = [
+            origin.strip()
+            for origin in self.cors_origins_raw.split(",")
+            if origin.strip()
+        ]
+
+        origins = list(self.default_cors_origins) if self.environment != "production" else []
+        for origin in configured_origins:
+            if origin not in origins:
+                origins.append(origin)
+
+        if self.frontend_url and self.frontend_url not in origins:
+            origins.insert(0, self.frontend_url)
+
+        deduped_origins: List[str] = []
+        for origin in origins:
+            if origin and origin not in deduped_origins:
+                deduped_origins.append(origin)
+
+        return deduped_origins
+
+
+# Create global settings instance
+settings = Settings()

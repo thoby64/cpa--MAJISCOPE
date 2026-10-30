@@ -1,0 +1,46 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: majiscope/backend:local
+    container_name: majiscope-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      MEDIA_STORAGE_PATH: /data/media
+    command:
+      - sh
+      - -c
+      - alembic -c alembic.sensor.ini upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - type: bind
+        source: 'D:\majiscope\backend-media'
+        target: /data/media
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+    networks:
+      - majiscope-app
+
+networks:
+  majiscope-app:
+    name: majiscope-app
+    external: true

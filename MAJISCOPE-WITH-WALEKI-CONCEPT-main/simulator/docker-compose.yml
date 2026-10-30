@@ -1,0 +1,38 @@
+services:
+  sensor-simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: majiscope/sensor-simulator:local
+    container_name: majiscope-sensor-simulator
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8083:8081"
+    volumes:
+      - type: bind
+        source: 'D:\majiscope\sensor-simulator\sensors.json'
+        target: /app/sensors.json
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+    networks:
+      - majiscope-app
+
+networks:
+  majiscope-app:
+    name: majiscope-app
+    external: true

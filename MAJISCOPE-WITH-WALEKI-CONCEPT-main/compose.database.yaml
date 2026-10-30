@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-majiscope}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the project-root .env file}
+      POSTGRES_DB: ${POSTGRES_DB:-majiscope_db}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - type: bind
+        source: ./database/init-sensor-db.sh
+        target: /docker-entrypoint-initdb.d/10-init-sensor-db.sh
+        read_only: true
+      - type: bind
+        source: 'D:\majiscope\postgres-data'
+        target: /var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks:
+      - majiscope-db
+      - majiscope-app
+
+networks:
+  majiscope-db:
+    name: majiscope-db
+  majiscope-app:
+    name: majiscope-app
+    external: true
